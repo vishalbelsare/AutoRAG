@@ -72,6 +72,11 @@ class Chroma(BaseVectorStore):
 		else:
 			self.collection.add(ids=ids, embeddings=text_embeddings)
 
+	def add_sync(self, ids: List[str], texts: List[str]):
+		texts = self.truncated_inputs(texts)
+		text_embeddings = self.embedding.get_text_embedding_batch(texts)
+		self.collection.add(ids=ids, embeddings=text_embeddings)
+
 	async def fetch(self, ids: List[str]) -> List[List[float]]:
 		if isinstance(self.collection, AsyncCollection):
 			fetch_result = await self.collection.get(ids, include=["embeddings"])

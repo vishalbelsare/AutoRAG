@@ -256,6 +256,17 @@ async def vectordb_ingest(
 			await vectordb.add(ids=id_batch, texts=content_batch)
 
 
+def vectordb_ingest_sync(vectordb: BaseVectorStore, corpus_data: pd.DataFrame):
+	embedding_batch = vectordb.embedding_batch
+	if not corpus_data.empty:
+		new_contents = corpus_data["contents"].tolist()
+		new_ids = corpus_data["doc_id"].tolist()
+		content_batches = make_batch(new_contents, embedding_batch)
+		id_batches = make_batch(new_ids, embedding_batch)
+		for content_batch, id_batch in zip(content_batches, id_batches):
+			vectordb.add_sync(ids=id_batch, texts=content_batch)
+
+
 def run_query_embedding_batch(
 	queries: List[str], embedding_model: BaseEmbedding, batch_size: int
 ) -> List[List[float]]:

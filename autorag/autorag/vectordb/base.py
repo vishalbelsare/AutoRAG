@@ -33,6 +33,10 @@ class BaseVectorStore:
 		pass
 
 	@abstractmethod
+	def add_sync(self, ids: List[str], texts: List[str]):
+		pass
+
+	@abstractmethod
 	async def query(
 		self, queries: List[str], top_k: int, **kwargs
 	) -> Tuple[List[List[str]], List[List[float]]]:

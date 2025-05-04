@@ -18,6 +18,7 @@ from autorag.nodes.retrieval.vectordb import (
 	vectordb_ingest,
 	filter_exist_ids,
 	filter_exist_ids_from_retrieval_gt,
+	vectordb_ingest_sync,
 )
 from autorag.schema import Node
 from autorag.schema.node import (
@@ -104,7 +105,11 @@ class Evaluator:
 			self.corpus_data.to_parquet(corpus_path_in_project, index=False)
 
 	def start_trial(
-		self, yaml_path: str, skip_validation: bool = False, full_ingest: bool = True
+		self,
+		yaml_path: str,
+		skip_validation: bool = False,
+		full_ingest: bool = True,
+		ingest_async: bool = True,
 	):
 		"""
 		Start AutoRAG trial.
@@ -118,6 +123,10 @@ class Evaluator:
 			Default is False.
 		:param full_ingest: If True, it checks the whole corpus data from corpus.parquet that exists in the Vector DB.
 			If your corpus is huge and don't want to check the whole vector DB, please set it to False.
+		:param ingest_async: If True, it ingests the corpus data asynchronously.
+			We highly recommend not using async on the "gpu-based" embedding models.
+			But for the API model, it is better to use an async version.
+			Default is True.
 		:return: None
 		"""
 		# Make Resources directory
@@ -176,8 +185,14 @@ class Evaluator:
 			):
 				task_ingest = progress.add_task("[cyan]Ingesting VectorDB...", total=1)
 
-				loop = get_event_loop()
-				loop.run_until_complete(self.__ingest_vectordb(yaml_path, full_ingest))
+				if ingest_async:
+					loop = get_event_loop()
+					loop.run_until_complete(
+						self.__ingest_vectordb(yaml_path, full_ingest)
+					)
+				else:
+					# Sync ingest
+					self.__ingest_vectordb_sync(yaml_path, full_ingest)
 
 				progress.update(task_ingest, completed=1)
 
@@ -546,15 +561,28 @@ class Evaluator:
 
 	async def __ingest_vectordb(self, yaml_path, full_ingest: bool):
 		vectordb_list = load_all_vectordb_from_yaml(yaml_path, self.project_dir)
+		target_corpus = await self.__make_target_corpus(yaml_path, full_ingest)
+		for vectordb in vectordb_list:
+			await vectordb_ingest(vectordb, target_corpus)
+
+	async def __make_target_corpus(self, yaml_path, full_ingest: bool):
+		vectordb_list = load_all_vectordb_from_yaml(yaml_path, self.project_dir)
 		if full_ingest is True:
-			# get the target ingest corpus from the whole corpus
 			for vectordb in vectordb_list:
 				target_corpus = await filter_exist_ids(vectordb, self.corpus_data)
-				await vectordb_ingest(vectordb, target_corpus)
+			return target_corpus
 		else:
-			# get the target ingest corpus from the retrieval gt only
 			for vectordb in vectordb_list:
 				target_corpus = await filter_exist_ids_from_retrieval_gt(
 					vectordb, self.qa_data, self.corpus_data
 				)
-				await vectordb_ingest(vectordb, target_corpus)
+			return target_corpus
+
+	def __ingest_vectordb_sync(self, yaml_path, full_ingest: bool):
+		vectordb_list = load_all_vectordb_from_yaml(yaml_path, self.project_dir)
+		loop = get_event_loop()
+		target_corpus = loop.run_until_complete(
+			self.__make_target_corpus(yaml_path, full_ingest)
+		)
+		for vectordb in vectordb_list:
+			vectordb_ingest_sync(vectordb, target_corpus)
