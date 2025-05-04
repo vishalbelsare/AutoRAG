@@ -51,13 +51,23 @@ def cli():
 	type=bool,
 	default=False,
 )
-def evaluate(config, qa_data_path, corpus_data_path, project_dir, skip_validation):
+@click.option(
+	"--ingest_async",
+	help="Ingest async or not. Default is True.",
+	type=bool,
+	default=True,
+)
+def evaluate(
+	config, qa_data_path, corpus_data_path, project_dir, skip_validation, ingest_async
+):
 	if not config.endswith(".yaml") and not config.endswith(".yml"):
 		raise ValueError(f"Config file {config} is not a yaml or yml file.")
 	if not os.path.exists(config):
 		raise ValueError(f"Config file {config} does not exist.")
 	evaluator = Evaluator(qa_data_path, corpus_data_path, project_dir=project_dir)
-	evaluator.start_trial(config, skip_validation=skip_validation)
+	evaluator.start_trial(
+		config, skip_validation=skip_validation, ingest_async=ingest_async
+	)
 
 
 @click.command()

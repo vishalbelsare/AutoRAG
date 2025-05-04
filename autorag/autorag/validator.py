@@ -89,7 +89,7 @@ class Validator:
 				corpus_data_path=corpus_path.name,
 				project_dir=temp_project_dir,
 			)
-			evaluator.start_trial(yaml_path, skip_validation=True)
+			evaluator.start_trial(yaml_path, skip_validation=True, ingest_async=False)
 			qa_path.close()
 			corpus_path.close()
 			os.unlink(qa_path.name)
