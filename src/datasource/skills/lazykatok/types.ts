@@ -1,0 +1,176 @@
+import type { RetrievalOptions } from "../../../retrieval/types.ts";
+import { DEFAULT_CONNECTOR_SYNC_TIMEOUT_MS } from "../../connector-timeouts.ts";
+
+/**
+ * Search modes accepted by the external `lazykatok search` subcommand.
+ *
+ * - `semantic` — dense vector similarity over indexed chunks.
+ * - `keyword`  — exact / tokenized keyword matching.
+ * - `hybrid`   — fused semantic + keyword scores.
+ */
+export type LazykatokSearchMode = "semantic" | "keyword" | "hybrid";
+
+/**
+ * Configuration for {@link LazykatokClient}. All fields optional; sensible defaults
+ * mirror the jikji client. The client spawns the `lazykatok` binary as a child
+ * process — it never opens the KakaoTalk database directly.
+ */
+export interface LazykatokOptions {
+	/** Explicit path to the `lazykatok` binary. Defaults to a bare `lazykatok` PATH lookup. */
+	readonly binaryPath?: string;
+	/**
+	 * Spawn timeout for interactive invocations (`doctor`, `search`, chunk lookups)
+	 * in milliseconds. Default 60_000. `sync`/`index` are non-interactive and use
+	 * {@link indexTimeoutMs} instead.
+	 */
+	readonly timeoutMs?: number;
+	/**
+	 * Spawn timeout for `sync`/`index` in milliseconds. Default 1_800_000 (30 min):
+	 * the first semantic index over a large archive was measured at ~11 minutes, and
+	 * a timed-out build restarts from scratch on the next refresh.
+	 */
+	readonly indexTimeoutMs?: number;
+	/** Max stdout/stderr bytes retained. Default 16 MiB (an `index --json` report alone is multiple MB on a real archive). */
+	readonly maxBufferBytes?: number;
+	/** Explicit native lazykatok data directory, passed as `--data-dir`. */
+	readonly workspacePath?: string;
+	/** Explicit operator-owned configuration/workspace transport. */
+	readonly configPath?: string;
+	/**
+	 * Source adapter passed to `sync --source`. Without it the CLI falls back to its
+	 * config file, whose default adapter is `fixture` and fails without a JSONL path.
+	 * AutoRAG names the live adapter (`macos`) on macOS and passes no flag elsewhere,
+	 * so a non-macOS operator's own CLI config still decides; set this to use another
+	 * adapter (`kakaocli`, `fixture`, …).
+	 */
+	readonly source?: string;
+	/** Environment overrides merged on top of `process.env` for the child. */
+	readonly env?: Readonly<Record<string, string | undefined>>;
+}
+
+export const DEFAULT_LAZYKATOK_BINARY = "lazykatok";
+export const DEFAULT_LAZYKATOK_TIMEOUT_MS = 60_000;
+/**
+ * `sync`/`index` default budget. They are non-interactive, so they must not share
+ * the 60-second interactive default: a first semantic index over a large archive
+ * was measured at ~11 minutes.
+ */
+export const DEFAULT_LAZYKATOK_INDEX_TIMEOUT_MS = DEFAULT_CONNECTOR_SYNC_TIMEOUT_MS;
+/** The live macOS adapter `sync` names by default on darwin. */
+export const DEFAULT_LAZYKATOK_SOURCE = "macos";
+// `lazykatok index --json` reports every written document (chunk id + path), so
+// a real archive's index output alone is multiple MB (9.4k documents ≈ 2.2 MB
+// measured against katok 0.3.3, whose CLI lazykatok continues). The cap exists
+// to bound memory on hostile output, not to fit index reports.
+export const DEFAULT_LAZYKATOK_MAX_BUFFER_BYTES = 16 * 1_048_576;
+export const DEFAULT_LAZYKATOK_OPTIONS = {
+	binaryPath: DEFAULT_LAZYKATOK_BINARY,
+	timeoutMs: DEFAULT_LAZYKATOK_TIMEOUT_MS,
+	maxBufferBytes: DEFAULT_LAZYKATOK_MAX_BUFFER_BYTES,
+} as const;
+
+/**
+ * Reasons a lazykatok CLI invocation can fail. The client never throws for these —
+ * every method returns a discriminated union with `ok: false` and one of these
+ * reasons.
+ */
+export type LazykatokFailureReason =
+	| "binary-missing"
+	| "nonzero-exit"
+	| "spawn-error"
+	| "timeout"
+	| "aborted"
+	| "stdout-too-large"
+	| "stderr-too-large"
+	| "invalid-json"
+	| "invalid-shape";
+
+/** Common failure payload shared by every method result union. */
+export interface LazykatokFailure {
+	readonly ok: false;
+	readonly reason: LazykatokFailureReason;
+	/** Raw stdout captured (may be partial / empty). Never a binary path. */
+	readonly stdout: string;
+	/** Raw stderr captured (may be partial / empty). Never a binary path. */
+	readonly stderr: string;
+	/** Exit code, or `null` when the process never exited normally. */
+	readonly code: number | null;
+	readonly hits?: readonly unknown[];
+}
+
+/** A single indexed chat chunk returned by the lazykatok CLI. */
+export interface LazykatokChunk {
+	readonly chunkId: string;
+	readonly content: string;
+	readonly metadata?: Readonly<Record<string, unknown>>;
+}
+
+/** A scored search hit. */
+export interface LazykatokSearchHit {
+	readonly chunkId: string;
+	readonly score: number;
+	readonly content: string;
+	readonly metadata?: Readonly<Record<string, unknown>>;
+	readonly source?: string;
+}
+export type LazykatokHit = LazykatokSearchHit;
+
+/** Result of `lazykatok doctor`. */
+export interface LazykatokDoctorInfo {
+	readonly version?: string;
+	readonly ready: boolean;
+	readonly metadata?: Readonly<Record<string, unknown>>;
+}
+
+/** Result of `lazykatok sync`. */
+export interface LazykatokSyncInfo {
+	readonly synced: boolean;
+	readonly messageCount?: number;
+	readonly metadata?: Readonly<Record<string, unknown>>;
+}
+
+/** Result of `lazykatok index`. */
+export interface LazykatokIndexInfo {
+	readonly chunkCount: number;
+	readonly metadata?: Readonly<Record<string, unknown>>;
+}
+
+/** Context payload: the chunks surrounding a target chunk. */
+export interface LazykatokContext {
+	readonly chunks: readonly LazykatokChunk[];
+	readonly metadata?: Readonly<Record<string, unknown>>;
+}
+
+/** Discriminated ok-success shape carrying typed `data`. */
+export interface LazykatokOk<T> {
+	readonly ok: true;
+	readonly data: T;
+	readonly stdout: string;
+	readonly stderr: string;
+	readonly code: number;
+}
+export interface LazykatokSearchOk {
+	readonly ok: true;
+	readonly hits: readonly LazykatokSearchHit[];
+	readonly stdout: string;
+	readonly stderr: string;
+	readonly code: number;
+	readonly data: { readonly hits: readonly LazykatokSearchHit[] };
+}
+
+export type LazykatokDoctorResult = LazykatokOk<LazykatokDoctorInfo> | LazykatokFailure;
+export type LazykatokSyncResult = LazykatokOk<LazykatokSyncInfo> | LazykatokFailure;
+export type LazykatokIndexResult = LazykatokOk<LazykatokIndexInfo> | LazykatokFailure;
+export type LazykatokSearchResult = LazykatokSearchOk | LazykatokFailure;
+export type LazykatokChunkResult = LazykatokOk<LazykatokChunk> | LazykatokFailure;
+export type LazykatokContextResult = LazykatokOk<LazykatokContext> | LazykatokFailure;
+/** The real `chunk parent --json` payload is a list of parent windows. */
+export type LazykatokParentResult = LazykatokOk<readonly LazykatokChunk[]> | LazykatokFailure;
+
+/**
+ * Search-specific options. Reuses the shared {@link RetrievalOptions} so the
+ * LazykatokSkill retrieval method can pass its options straight through. The
+ * client maps `topK` to the native CLI limit flag; other fields are handled
+ * by the retrieval layer or are not supported by lazykatok.
+ */
+export type LazykatokSearchOptions = RetrievalOptions;

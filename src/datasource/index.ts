@@ -1,0 +1,177 @@
+export { type AliasDatasourceSkillOptions, AliasedDatasourceSkill } from "./aliased-skill.ts";
+export {
+	DatasourceChunkStore,
+	type DatasourceChunkStoreOptions,
+	datasourceChunkStorePath,
+	type ScoredChunk,
+	type StoredChunk,
+} from "./chunk-store.ts";
+export {
+	boundDiagnosticText,
+	type ConnectorDocument,
+	type ConnectorFailureReason,
+	type ConnectorFetchFail,
+	type ConnectorFetchOk,
+	type ConnectorFetchResult,
+	connectorFailureToDiagnosticCode,
+	type DatasourceConnector,
+	sanitizeIdSegment,
+} from "./connector.ts";
+export {
+	ConnectorDatasourceSkill,
+	ConnectorLexicalMethod,
+	type ConnectorSkillDefinition,
+	type ConnectorSkillOptions,
+} from "./connector-skill.ts";
+export { mapDatasourceDiagnostic, mapDatasourceDiagnostics } from "./diagnostics.ts";
+export { type CronParseResult, isDue, parseCronExpr } from "./polling.ts";
+export { DatasourceSkillRegistry, type RegisteredDatasourceSkill } from "./registry.ts";
+export {
+	buildDatasourceChunkSource,
+	buildDatasourceInstanceSource,
+	DATASOURCE_CHUNKS_SEGMENT,
+	datasourceSourceHasFragment,
+	datasourceSourcePath,
+	filterDatasourceScope,
+	isDatasourceSource,
+	matchesDatasourceScope,
+	matchesVirtualPathScope,
+	normalizeVirtualPath,
+	type ResultsByMethod,
+} from "./scope.ts";
+export {
+	CLOUD_DRIVE_SKILL_DEFINITION,
+	CloudDriveSkill,
+	type CloudDriveSkillOptions,
+	RcloneConnector,
+	type RcloneConnectorOptions,
+	type RcloneRunner,
+	type RcloneRunResult,
+} from "./skills/cloud-drive/index.ts";
+export {
+	DEFAULT_DISCRAWL_EMBEDDING_MODEL,
+	DEFAULT_DISCRAWL_MODE,
+	DiscrawlClient,
+	type DiscrawlFailureReason,
+	DiscrawlFtsMethod,
+	DiscrawlHybridMethod,
+	type DiscrawlOptions,
+	type DiscrawlSearchHit,
+	type DiscrawlSearchMode,
+	type DiscrawlSearchOptions,
+	type DiscrawlSearchResult,
+	DiscrawlSemanticMethod,
+	DiscrawlSkill,
+	type DiscrawlSkillClient,
+	type DiscrawlSkillOptions,
+	ENGLISH_ONLY_EMBEDDING_MODELS,
+} from "./skills/discrawl/index.ts";
+export {
+	BUILTIN_DATASOURCE_SKILL_NAMES,
+	type BuildDatasourceSkillsResult,
+	buildDatasourceSkills,
+	type DatasourceSkillConfig,
+	type DatasourcesConfig,
+} from "./skills/factory.ts";
+export {
+	GitHubConnector,
+	type GitHubConnectorOptions,
+	GitHubSkill,
+	type GitHubSkillOptions,
+} from "./skills/github/index.ts";
+export { LarkClient, type LarkClientOptions, LarkSkill, type LarkSkillOptions } from "./skills/lark/index.ts";
+export type {
+	LazykatokFailureReason,
+	LazykatokHit,
+	LazykatokOptions,
+	LazykatokSearchMode,
+	LazykatokSearchOptions,
+	LazykatokSearchResult,
+	LazykatokSkillClient,
+	LazykatokSkillOptions,
+} from "./skills/lazykatok/index.ts";
+export {
+	LazykatokBm25Method,
+	LazykatokClient,
+	LazykatokSemanticMethod,
+	LazykatokSkill,
+} from "./skills/lazykatok/index.ts";
+export {
+	MailExportConnector,
+	type MailExportConnectorOptions,
+	MailExportSkill,
+	type MailExportSkillOptions,
+} from "./skills/mail-export/index.ts";
+export {
+	MAILCRAWL_MODES,
+	MailcrawlClient,
+	type MailcrawlFailure,
+	type MailcrawlFailureReason,
+	type MailcrawlIndexInfo,
+	MailcrawlMethod,
+	type MailcrawlOptions,
+	type MailcrawlSearchHit,
+	type MailcrawlSearchMode,
+	type MailcrawlSearchResult,
+	MailcrawlSkill,
+	type MailcrawlSyncInfo,
+	type MailcrawlSyncResult,
+} from "./skills/mailcrawl/index.ts";
+export {
+	NotcrawlClient,
+	type NotcrawlOptions,
+	NotionSkill,
+	type NotionSkillOptions,
+} from "./skills/notion/index.ts";
+export {
+	ObsidianBm25Method,
+	ObsidianSemanticMethod,
+	ObsidianSkill,
+	type ObsidianSkillClient,
+	type ObsidianSkillOptions,
+	QmdClient,
+	type QmdOptions,
+	type QmdSearchHit,
+	type QmdSearchMode,
+	type QmdSearchResult,
+} from "./skills/obsidian/index.ts";
+export {
+	RssConnector,
+	type RssConnectorOptions,
+	type RssFeedConfig,
+	RssSkill,
+	type RssSkillOptions,
+} from "./skills/rss/index.ts";
+export {
+	SlackSkill,
+	type SlackSkillOptions,
+	SlacrawlClient,
+	type SlacrawlOptions,
+} from "./skills/slack/index.ts";
+export {
+	SpotlightConnector,
+	type SpotlightConnectorOptions,
+	SpotlightSkill,
+	type SpotlightSkillOptions,
+} from "./skills/spotlight/index.ts";
+export {
+	TelecrawlClient,
+	type TelecrawlOptions,
+	TelecrawlSkill,
+	type TelecrawlSkillOptions,
+} from "./skills/telecrawl/index.ts";
+export { WacrawlClient, type WacrawlOptions, WacrawlSkill, type WacrawlSkillOptions } from "./skills/wacrawl/index.ts";
+export type {
+	DatasourceDiagnostic,
+	DatasourceDiagnosticCode,
+	DatasourceIndexFail,
+	DatasourceIndexOk,
+	DatasourceIndexOptions,
+	DatasourceIndexResult,
+	DatasourceInstance,
+	DatasourceSkill,
+	DatasourceSkillDescriptor,
+	DatasourceSkillManifest,
+	PollingMetadata,
+	SourceDescription,
+} from "./types.ts";

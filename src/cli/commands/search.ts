@@ -1,0 +1,257 @@
+import { AutoRAGAgent, type AutoRAGAgentOptions, type AutoRAGThinkingLevel } from "../../agent/agent.ts";
+import type { DecompositionModel } from "../../agent/query-decomposition.ts";
+import { stopRuntime as stopEmbeddingRuntime } from "../../embedding-runtime/index.ts";
+import {
+	buildAgentOptions,
+	type CliConfig,
+	ConfigError,
+	type ResolveAgentModelOptions,
+	type ResolvedAgentModel,
+	resolveAgentModel,
+	resolveConfig,
+	resolveQueryDecompositionModel,
+} from "../config.ts";
+import { renderError, renderPreliminary, renderSearch } from "../output.ts";
+import type { CommandContext } from "./types.ts";
+
+// ---------------------------------------------------------------------------
+// Search health hints (Issue #49)
+// ---------------------------------------------------------------------------
+
+/**
+ * A recoverable health hint surfaced when `autorag search` fails for a reason
+ * that `autorag health` can diagnose. The classifier only produces hints for
+ * model/provider failures — never for retrieval, index, datasource,
+ * or empty-query errors.
+ */
+export interface SearchHealthHint {
+	command: "autorag health";
+	reason: "model_resolution" | "auth_missing" | "provider_unreachable" | "timeout";
+	message: string;
+}
+
+const HEALTH_HINT_MESSAGE = "Run autorag health to diagnose model/provider setup.";
+
+const AUTH_PATTERNS: readonly string[] = [
+	"api key",
+	"apikey",
+	"401",
+	"403",
+	"unauthorized",
+	"forbidden",
+	"authentication",
+];
+
+const PROVIDER_PATTERNS: readonly string[] = [
+	"enotfound",
+	"econnrefused",
+	"etimedout",
+	"provider unreachable",
+	"unreachable",
+	"network",
+	"socket hang up",
+];
+
+/**
+ * Classify a search error into an optional {@link SearchHealthHint}.
+ * Returns `undefined` for errors outside the allowlist (empty query,
+ * retrieval/index/datasource failures, generic errors).
+ */
+export function classifySearchHealthHint(error: unknown): SearchHealthHint | undefined {
+	const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+	const name = error instanceof Error ? error.name : "";
+
+	// 1. ConfigError / unknown model / no model configured → model_resolution.
+	if (error instanceof ConfigError || name === "ConfigError") {
+		return { command: "autorag health", reason: "model_resolution", message: HEALTH_HINT_MESSAGE };
+	}
+	if (message.includes("unknown configured") || message.includes("no model configured")) {
+		return { command: "autorag health", reason: "model_resolution", message: HEALTH_HINT_MESSAGE };
+	}
+
+	// 2. Auth / API key / 401 / 403 → auth_missing.
+	for (const pattern of AUTH_PATTERNS) {
+		if (message.includes(pattern)) {
+			return { command: "autorag health", reason: "auth_missing", message: HEALTH_HINT_MESSAGE };
+		}
+	}
+
+	// 3. Network / provider unreachable → provider_unreachable.
+	if (typeof error === "object" && error !== null && "code" in error) {
+		const code = (error as { code?: unknown }).code;
+		if (code === "ENOTFOUND" || code === "ECONNREFUSED" || code === "ETIMEDOUT") {
+			return { command: "autorag health", reason: "provider_unreachable", message: HEALTH_HINT_MESSAGE };
+		}
+	}
+	for (const pattern of PROVIDER_PATTERNS) {
+		if (message.includes(pattern)) {
+			return { command: "autorag health", reason: "provider_unreachable", message: HEALTH_HINT_MESSAGE };
+		}
+	}
+
+	// 4. AbortError / timeout → timeout.
+	if (
+		name === "AbortError" ||
+		message.includes("abort") ||
+		message.includes("timeout") ||
+		message.includes("timed out")
+	) {
+		return { command: "autorag health", reason: "timeout", message: HEALTH_HINT_MESSAGE };
+	}
+
+	return undefined;
+}
+
+/**
+ * Search-command dependencies. Tests inject `agentFactory` to bypass real
+ * model construction and AutoRAGAgent instantiation, returning a stub whose
+ * `searchDocumentsStream` yields progress and a canned completion.
+ */
+export interface SearchDeps {
+	agentFactory?: (opts: AutoRAGAgentOptions) => Pick<AutoRAGAgent, "searchDocumentsStream">;
+	modelResolver?: (
+		config: CliConfig,
+		options?: ResolveAgentModelOptions,
+	) => ResolvedAgentModel | Promise<ResolvedAgentModel>;
+	/**
+	 * Stops the on-demand embedding gateway so the process can exit. Without
+	 * this the semantic MinSync path's loopback gateway keeps the event loop
+	 * alive after the search completes and the CLI never exits.
+	 */
+	stopRuntime?: () => Promise<void>;
+}
+
+interface SearchOptions {
+	topK?: number;
+	scope?: string;
+}
+
+const THINKING_LEVELS: readonly AutoRAGThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+function parseThinkingLevel(value: string | boolean | undefined): AutoRAGThinkingLevel | undefined {
+	if (typeof value !== "string" || value.trim() === "") return undefined;
+	return (THINKING_LEVELS as readonly string[]).includes(value) ? (value as AutoRAGThinkingLevel) : undefined;
+}
+
+/**
+ * Per-phase thinking flags for the two-phase (fast → verification) search.
+ * `--fast-thinking` and `--final-thinking` set the levels (default: off/high).
+ * An unrecognized level rejects with exit 2.
+ */
+function buildThinkingFlags(flags: CommandContext["flags"]): AutoRAGAgentOptions["thinking"] | undefined {
+	const fastProvided = flags["fast-thinking"] !== undefined;
+	const finalProvided = flags["final-thinking"] !== undefined;
+	const fast = parseThinkingLevel(flags["fast-thinking"]);
+	const final = parseThinkingLevel(flags["final-thinking"]);
+	if ((fastProvided && fast === undefined) || (finalProvided && final === undefined)) {
+		throw new Error(
+			`Invalid thinking level. Use one of: ${THINKING_LEVELS.join(", ")} (--fast-thinking/--final-thinking).`,
+		);
+	}
+	if (fast === undefined && final === undefined) return undefined;
+	return { ...(fast !== undefined ? { fast } : {}), ...(final !== undefined ? { final } : {}) };
+}
+
+function parseIntOptional(value: string | boolean | undefined): number | undefined {
+	if (typeof value !== "string" || value.trim() === "") return undefined;
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed)) return undefined;
+	return Math.trunc(parsed);
+}
+
+function buildSearchOptions(flags: CommandContext["flags"]): SearchOptions {
+	const options: SearchOptions = {};
+	const topK = parseIntOptional(flags["top-k"]);
+	if (topK !== undefined) options.topK = topK;
+	if (typeof flags.scope === "string" && flags.scope.trim() !== "") options.scope = flags.scope;
+	return options;
+}
+
+/**
+ * Run the `autorag search` command. Returns exit code 0 on success, 2 for
+ * usage/config errors (empty query, missing model), 1 for runtime errors.
+ */
+export async function runSearch(ctx: CommandContext, deps: SearchDeps = {}): Promise<number> {
+	const query = ctx.positionals.join(" ").trim();
+	if (query.length === 0) {
+		ctx.stderr(
+			renderError(new Error("Usage: autorag search <query> [--top-k N] [--scope SCOPE]"), {
+				json: ctx.json,
+				debug: ctx.debug,
+			}),
+		);
+		return 2;
+	}
+
+	let config: CliConfig;
+	try {
+		config = resolveConfig({ flags: ctx.flags, cwd: ctx.cwd });
+	} catch (error) {
+		ctx.stderr(renderError(error, { json: ctx.json, debug: ctx.debug }));
+		return 2;
+	}
+
+	let agent: Pick<AutoRAGAgent, "searchDocumentsStream">;
+	let thinking: AutoRAGAgentOptions["thinking"] | undefined;
+	try {
+		thinking = buildThinkingFlags(ctx.flags);
+	} catch (error) {
+		ctx.stderr(renderError(error, { json: ctx.json, debug: ctx.debug }));
+		return 2;
+	}
+	if (deps.agentFactory && deps.modelResolver === undefined) {
+		agent = deps.agentFactory({
+			...buildAgentOptions(config),
+			...(thinking !== undefined ? { thinking } : {}),
+		});
+	} else {
+		let resolvedModel: ResolvedAgentModel;
+		let decompositionModel: DecompositionModel | undefined;
+		try {
+			resolvedModel = await (deps.modelResolver ?? resolveAgentModel)(config);
+			decompositionModel = await resolveQueryDecompositionModel(config);
+		} catch (error) {
+			const hint = classifySearchHealthHint(error);
+			ctx.stderr(renderError(error, { json: ctx.json, debug: ctx.debug, hint }));
+			return 2;
+		}
+		const agentOptions: AutoRAGAgentOptions = {
+			...buildAgentOptions(config),
+			model: resolvedModel.model,
+			...(resolvedModel.apiKey !== undefined ? { apiKey: resolvedModel.apiKey } : {}),
+			...(resolvedModel.providerApiKeys !== undefined ? { providerApiKeys: resolvedModel.providerApiKeys } : {}),
+			...(decompositionModel !== undefined ? { queryDecomposition: decompositionModel } : {}),
+			...(thinking !== undefined ? { thinking } : {}),
+		};
+		agent = deps.agentFactory ? deps.agentFactory(agentOptions) : new AutoRAGAgent(agentOptions);
+	}
+
+	const options = buildSearchOptions(ctx.flags);
+	const stopRuntime = deps.stopRuntime ?? stopEmbeddingRuntime;
+	try {
+		for await (const event of agent.searchDocumentsStream(query, options)) {
+			switch (event.type) {
+				case "progress":
+					if (event.text.trim() === "") break;
+					ctx.stdout(ctx.json ? JSON.stringify({ type: "progress", text: event.text }) : event.text);
+					break;
+				case "preliminary":
+					ctx.stdout(renderPreliminary(event.response, { json: ctx.json, debug: ctx.debug }));
+					break;
+				case "complete":
+					ctx.stdout(renderSearch(event.response, { json: ctx.json, debug: ctx.debug }));
+					break;
+			}
+		}
+		return 0;
+	} catch (error) {
+		const hint = classifySearchHealthHint(error);
+		ctx.stderr(renderError(error, { json: ctx.json, debug: ctx.debug, hint }));
+		return 1;
+	} finally {
+		// The semantic MinSync path starts the loopback embedding gateway on
+		// demand; without an explicit stop it keeps the event loop alive and
+		// the CLI never exits after the answer has been printed.
+		await stopRuntime();
+	}
+}

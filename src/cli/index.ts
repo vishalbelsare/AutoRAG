@@ -1,0 +1,377 @@
+#!/usr/bin/env node
+import { realpathSync } from "node:fs";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
+import { releaseRuntimeHandles } from "../embedding-runtime/index.ts";
+import { commandUsage } from "./command-help.ts";
+import type { CommandContext } from "./commands/types.ts";
+import { renderError } from "./output.ts";
+import { readPackageVersion } from "./version.ts";
+
+const BOOLEAN_FLAGS = new Set([
+	"json",
+	"debug",
+	"help",
+	"version",
+	"force",
+	"yes",
+	"once",
+	"immediate",
+	"skip-probes",
+	"full",
+	"retry-failed",
+	"strict",
+	"refresh",
+	"available",
+]);
+const VALUE_FLAGS = new Set([
+	"config",
+	"search-paths",
+	"languages",
+	"workspace",
+	"memory-path",
+	"model-provider",
+	"model-id",
+	"top-k",
+	"scope",
+	"result",
+	"debounce-ms",
+	"method",
+	"embedder-id",
+	"embedder-base-url",
+	"embedder-api-key-env",
+	"embedder-dimension",
+	"embedder-query-prefix",
+	"embedder-passage-prefix",
+	"embedder-timeout-ms",
+	"embedder-batch-size",
+	"minsync-max-chunk-size",
+	"timeout-ms",
+	"port",
+	"peer",
+	"accept",
+	"alias",
+	"endpoint",
+	"remove",
+	"add",
+	"contact-id",
+	"edit",
+	"show",
+	"rank",
+	"description",
+	"input",
+	"profile",
+	"format",
+	"provider",
+	"fast-thinking",
+	"final-thinking",
+]);
+
+const COMMANDS = [
+	"init",
+	"setup",
+	"refresh",
+	"status",
+	"search",
+	"evidence",
+	"memory",
+	"index",
+	"watch",
+	"health",
+	"duplicates",
+	"tui",
+	"serve",
+	"p2p",
+	"lite",
+	"models",
+	"gateway",
+	"update-check",
+] as const;
+type CommandName = (typeof COMMANDS)[number];
+
+export type { CommandName };
+
+interface ParsedArgs {
+	positionals: string[];
+	flags: Record<string, string | boolean>;
+}
+
+const USAGE = `autorag - self-evolving librarian CLI
+
+Usage: autorag <command> [args] [flags]
+
+Commands:
+  init                 Write ~/.autorag/config.json for a local collection
+  setup                Probe and configure local runtime and datasources
+                       (--search-paths a,b  --workspace DIR  --profile ID  --format json)
+  refresh              Refresh every configured index; --method narrows the run
+  watch                Watch configured roots (or --once for cron/poll tick)
+  status               Show corpus freshness and index health
+  search <query>       Search and curate documents (requires a configured model)
+  evidence <session>   Show persisted source/chunk evidence (--result N)
+  memory inspect       Inspect the retrieval memory snapshot
+  index reset          Remove parsed/minsync indexes (--method)
+  index rebuild        Reset then re-run a refresh (--method minsync|all)
+  health               Check model/provider auth and completion access (no index check)
+  lite init|refresh|watch|status|index|duplicates|health
+                       Model-free setup, indexing, status, and datasource lifecycle
+                       (lite refresh: --full --force --retry-failed --method; watch: --once)
+  lite retrieve <query>
+                       Retrieve documents without model curation
+                       (--top-k N  --scope SCOPE  --json  --debug)
+  lite report <query>   Persist a structured report (--input FILE)
+  duplicates [DIR]     Scan exact/near duplicate document families; never deletes files
+  tui                  Open an interactive Pi-powered librarian terminal UI
+  serve                Start the P2P peer query server over SimpleX
+                       (--port N  --force)
+  p2p                  SimpleX peer trust management
+                       (peers [--add <alias> --contact-id <n>] [--edit <alias>]
+                        [--description <text>]
+                        [--show <alias>] [--rank <query>] [--remove <alias>])
+                       (requests [approve|deny <id>])
+  p2p policy list      Show effective merged sharing policy (virtual-path keys)
+  p2p policy set       Set a sharing rule: <source-glob> <private|never|always|peers> [--peer fp...]
+  p2p policy unset     Remove a sharing rule by key
+  models list          List chat models from the pi runtime (--provider ID --available)
+  models prefetch|import|verify
+                       Manage verified embedding model cache (--profile ID)
+  gateway status|stop  Inspect or stop the on-demand embedding gateway (--format json)
+  update-check         Compare the running autorag against the published npm version
+
+Setup:
+  autorag init --search-paths /path/to/docs,/path/to/notes   # choose folders
+  autorag refresh                                            # parsed + MinSync + datasources + Jikji
+  autorag watch --once                                       # single index refresh tick (cron)
+  autorag search "your question"                             # curated answer
+
+Global flags:
+  --json               Emit machine-readable JSON
+  --debug              Reveal opaque internal diagnostics (never filesystem paths)
+  --config <path>      Use a specific config file
+  --search-paths <csv> Folders to index/search (also AUTORAG_SEARCH_PATHS)
+  --languages <csv>    OCR/parser languages (also AUTORAG_LANGUAGES)
+  --model-provider <name>  Override the model provider
+  --model-id <id>          Override the model
+  --once               For watch: run one refresh tick and exit (for cron)
+  --immediate          For watch: refresh once before reading fs events (default true)
+  --debounce-ms <n>    For watch: debounce milliseconds for fs events (default 1500)
+  --method <csv>       For refresh/index: minsync,parsed,datasources,jikji,everything,fsearch,all
+  --skip-probes        For health: skip the network completion probe (auth checks still run)
+  --timeout-ms <n>     For health: per-probe timeout in ms (default 10000)
+  --version, -V        Print the package version
+  --help, -h           Show this help
+
+Run: autorag <command> --help   for command-specific usage.
+`;
+
+export function parseArgs(argv: readonly string[]): ParsedArgs | { error: string } {
+	const positionals: string[] = [];
+	const flags: Record<string, string | boolean> = {};
+	for (let i = 0; i < argv.length; i++) {
+		const token = argv[i];
+		if (token === "-h") {
+			flags.help = true;
+			continue;
+		}
+		if (token === "-V") {
+			flags.version = true;
+			continue;
+		}
+		if (!token.startsWith("--")) {
+			positionals.push(token);
+			continue;
+		}
+		const body = token.slice(2);
+		const eq = body.indexOf("=");
+		const key = eq === -1 ? body : body.slice(0, eq);
+		if (!BOOLEAN_FLAGS.has(key) && !VALUE_FLAGS.has(key)) {
+			return { error: `Unknown flag: --${key}` };
+		}
+		if (eq !== -1) {
+			flags[key] = body.slice(eq + 1);
+			continue;
+		}
+		if (BOOLEAN_FLAGS.has(key)) {
+			flags[key] = true;
+			continue;
+		}
+		const next = argv[i + 1];
+		if (next === undefined || next.startsWith("--")) {
+			return { error: `Flag --${key} requires a value` };
+		}
+		flags[key] = next;
+		i++;
+	}
+	return { positionals, flags };
+}
+
+function promptYesNo(question: string): Promise<boolean> {
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	return new Promise((resolve) => {
+		rl.question(`${question} [y/N] `, (answer) => {
+			rl.close();
+			resolve(/^y(es)?$/i.test(answer.trim()));
+		});
+	});
+}
+
+async function dispatch(command: CommandName, ctx: CommandContext): Promise<number> {
+	switch (command) {
+		case "init": {
+			const { runInit } = await import("./commands/init.ts");
+			return runInit(ctx);
+		}
+		case "setup": {
+			const { runSetupCommand } = await import("./commands/setup.ts");
+			return runSetupCommand(ctx);
+		}
+		case "refresh": {
+			const { runRefresh } = await import("./commands/refresh.ts");
+			return runRefresh(ctx);
+		}
+		case "status": {
+			const { runStatus } = await import("./commands/status.ts");
+			return runStatus(ctx);
+		}
+		case "search": {
+			const { runSearch } = await import("./commands/search.ts");
+			return runSearch(ctx);
+		}
+		case "evidence": {
+			const { runEvidence } = await import("./commands/evidence.ts");
+			return runEvidence(ctx);
+		}
+		case "memory": {
+			const { runMemory } = await import("./commands/memory.ts");
+			return runMemory(ctx);
+		}
+		case "index": {
+			const { runIndex } = await import("./commands/index.ts");
+			return runIndex(ctx);
+		}
+		case "watch": {
+			const { runWatch } = await import("./commands/watch.ts");
+			return runWatch(ctx);
+		}
+		case "health": {
+			const { runHealth } = await import("./commands/health.ts");
+			return runHealth(ctx);
+		}
+		case "duplicates": {
+			const { runDuplicates } = await import("./commands/duplicates.ts");
+			return runDuplicates(ctx);
+		}
+		case "tui": {
+			const { runTui } = await import("./commands/tui.ts");
+			return runTui(ctx);
+		}
+		case "serve": {
+			const { runServe } = await import("./commands/serve.ts");
+			return runServe(ctx);
+		}
+		case "p2p": {
+			if (ctx.positionals[0] === "policy") {
+				const { runP2pPolicy } = await import("./commands/p2p-policy.ts");
+				ctx.positionals = ctx.positionals.slice(1);
+				return runP2pPolicy(ctx);
+			}
+			const { runP2p } = await import("./commands/p2p.ts");
+			return runP2p(ctx);
+		}
+		case "lite": {
+			return dispatchLite(ctx);
+		}
+		case "models": {
+			const { runModels } = await import("./commands/models.ts");
+			return runModels(ctx);
+		}
+		case "gateway": {
+			const { runGateway } = await import("./commands/gateway.ts");
+			return runGateway(ctx);
+		}
+		case "update-check": {
+			const { runUpdateCheck } = await import("./commands/update-check.ts");
+			return runUpdateCheck(ctx);
+		}
+	}
+}
+
+export async function main(argv: readonly string[]): Promise<number> {
+	const parsed = parseArgs(argv);
+	if ("error" in parsed) {
+		process.stderr.write(`${parsed.error}\n`);
+		return 2;
+	}
+	const { positionals, flags } = parsed;
+	const command = positionals[0];
+	const json = flags.json === true;
+	const debug = flags.debug === true;
+
+	if (flags.version === true || command === "version") {
+		process.stdout.write(`${readPackageVersion()}\n`);
+		return 0;
+	}
+	if (flags.help === true || command === undefined || command === "help") {
+		if (command === "lite") {
+			// Defer to lite dispatch for subcommand-specific help.
+		} else {
+			process.stdout.write(commandUsage(command) ?? USAGE);
+			return 0;
+		}
+	}
+	if (!(COMMANDS as readonly string[]).includes(command)) {
+		process.stderr.write(`Unknown command: ${command}\n\n${USAGE}`);
+		return 2;
+	}
+
+	const ctx: CommandContext = {
+		positionals: positionals.slice(1),
+		flags,
+		json,
+		debug,
+		cwd: process.cwd(),
+		stdout: (line: string) => process.stdout.write(`${line}\n`),
+		stderr: (line: string) => process.stderr.write(`${line}\n`),
+		promptYesNo,
+	};
+
+	try {
+		return await dispatch(command as CommandName, ctx);
+	} catch (error) {
+		process.stderr.write(`${renderError(error, { json, debug })}\n`);
+		return 1;
+	} finally {
+		// The local embedding gateway listens on loopback for the whole run, so a
+		// command that used it would keep the process alive after its output is
+		// written (and after its answer is already on stdout). Release it here, where
+		// every command is covered, and the shared supervisor's model stays warm.
+		await releaseRuntimeHandles();
+	}
+}
+
+function isInvokedDirectly(): boolean {
+	const entry = process.argv[1];
+	if (entry === undefined) return false;
+	try {
+		return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+	} catch {
+		return false;
+	}
+}
+
+async function dispatchLite(ctx: CommandContext): Promise<number> {
+	const { runLite } = await import("./commands/lite.ts");
+	return runLite(ctx);
+}
+
+if (isInvokedDirectly()) {
+	main(process.argv.slice(2)).then(
+		(code) => {
+			process.exitCode = code;
+		},
+		(error) => {
+			process.stderr.write(`${renderError(error, { json: false, debug: false })}\n`);
+			process.exitCode = 1;
+		},
+	);
+}

@@ -1,0 +1,330 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { runSetup } from "../../src/cli/setup.ts";
+
+const roots: string[] = [];
+afterEach(() => {
+	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+function fakeLock() {
+	return { path: "setup.lock", contents: "", assertOwned() {}, release() {} };
+}
+
+describe("setup orchestration", () => {
+	it("keeps probes independent, preserves operator embedder config, and degrades to BM25", async () => {
+		const root = mkdtempSync(join(tmpdir(), "autorag-setup-"));
+		roots.push(root);
+		const configPath = join(root, "config.json");
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				searchPaths: ["/docs"],
+				workspacePath: root,
+				minSync: {
+					embedder: { id: "operator-model", baseUrl: "https://remote.invalid/v1", apiKeyEnv: "SECRET_KEY" },
+				},
+				datasources: { discord: { connector: { binaryPath: "/bin/sh" } } },
+			}),
+		);
+		const report = await runSetup({
+			configPath,
+			workspacePath: root,
+			deps: {
+				env: { PATH: "/bin", HOME: root },
+				executable: (name) => (name === "/bin/sh" ? name : undefined),
+				pathExists: () => true,
+				acquireLock: fakeLock,
+				runtime: {
+					runtimeStatus: async () => {
+						throw new Error("health /Users/alice/.secret/token=abc");
+					},
+					verifyModel: async () => {
+						throw new Error("offline");
+					},
+				},
+			},
+		});
+		expect(report.mode).toBe("bm25");
+		expect(report.datasources.find((d) => d.name === "discord")?.state).toBe("blocked");
+		expect(JSON.stringify(report)).not.toContain("/Users/alice");
+		const config = JSON.parse(readFileSync(configPath, "utf8"));
+		expect(config.minSync.embedder).toEqual({
+			id: "operator-model",
+			baseUrl: "https://remote.invalid/v1",
+			apiKeyEnv: "SECRET_KEY",
+		});
+	});
+
+	it("reports semantic mode when the runtime answers a live health probe", async () => {
+		const root = mkdtempSync(join(tmpdir(), "autorag-setup-"));
+		roots.push(root);
+		const configPath = join(root, "config.json");
+		writeFileSync(configPath, JSON.stringify({ searchPaths: [join(root, "docs")], workspacePath: root }));
+		const report = await runSetup({
+			configPath,
+			workspacePath: root,
+			deps: {
+				env: { PATH: "/bin", HOME: root },
+				executable: () => undefined,
+				pathExists: () => true,
+				acquireLock: fakeLock,
+				runtime: {
+					runtimeStatus: async () => ({
+						state: "ready",
+						backend: "auto",
+						model: "Qwen3-Embedding-0.6B-Q8_0.gguf",
+						health: { ok: true, profileId: "qwen3-embedding-0.6b", dimension: 1024, runtimeBuild: "b10951" },
+					}),
+					verifyModel: async () => ({
+						profileId: "qwen3-embedding-0.6b",
+						path: "/cache/model.gguf",
+						hash: "sha",
+					}),
+				},
+			},
+		});
+		expect(report.mode).toBe("semantic");
+		expect(report.ok).toBe(true);
+		expect(report.remediation).toBeUndefined();
+		expect(report.runtime).toEqual({
+			state: "ready",
+			health: true,
+			model: "Qwen3-Embedding-0.6B-Q8_0.gguf",
+		});
+		const config = JSON.parse(readFileSync(configPath, "utf8"));
+		expect(config.minSync.embedder).toEqual({
+			id: "native:Qwen/Qwen3-Embedding-0.6B",
+			dimension: 1024,
+		});
+	});
+
+	it("never requires an env credential for a CLI-backed datasource", async () => {
+		const root = mkdtempSync(join(tmpdir(), "autorag-setup-"));
+		roots.push(root);
+		const configPath = join(root, "config.json");
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				searchPaths: [join(root, "docs")],
+				workspacePath: root,
+				datasources: {
+					discord: {
+						instanceId: "geumcheon-artville",
+						connector: {
+							tokenEnv: "DISCORD_BOT_TOKEN",
+							guildId: "1490970691820847155",
+							channels: ["일반"],
+							maxDocuments: 300,
+						},
+					},
+					slack: { connector: { tokenEnv: "SLACK_TOKEN" } },
+					github: { connector: { tokenEnv: "GITHUB_TOKEN", repos: ["Marker-Inc-Korea/AutoRAG"] } },
+				},
+			}),
+		);
+		const report = await runSetup({
+			configPath,
+			workspacePath: root,
+			deps: {
+				env: { PATH: "/bin", HOME: root },
+				executable: (name) => (name === "discrawl" || name === "slacrawl" ? `/usr/local/bin/${name}` : undefined),
+				pathExists: () => true,
+				acquireLock: fakeLock,
+				runtime: {
+					runtimeStatus: async () => ({
+						state: "ready",
+						backend: "auto",
+						model: "Qwen3-Embedding-0.6B-Q8_0.gguf",
+						health: { ok: true, profileId: "qwen3-embedding-0.6b", dimension: 1024, runtimeBuild: "b10951" },
+					}),
+					verifyModel: async () => ({
+						profileId: "qwen3-embedding-0.6b",
+						path: "/cache/model.gguf",
+						hash: "sha",
+					}),
+				},
+			},
+		});
+		// The discord datasource reads discrawl's native store: the optional bot
+		// token is not a runtime requirement, so the probe must not invent one.
+		expect(report.datasources.find((entry) => entry.name === "discord")?.state).toBe("configured");
+		expect(JSON.stringify(report)).not.toContain("DISCORD_BOT_TOKEN");
+		expect(report.datasources.find((entry) => entry.name === "slack")?.state).toBe("configured");
+		// A non-CLI connector still owns an AutoRAG-side credential.
+		expect(report.datasources.find((entry) => entry.name === "github")).toMatchObject({
+			state: "skipped",
+			reason: "credential GITHUB_TOKEN is unavailable",
+		});
+	});
+
+	it("surfaces a runtime startup failure instead of discarding it", async () => {
+		const root = mkdtempSync(join(tmpdir(), "autorag-setup-"));
+		roots.push(root);
+		const configPath = join(root, "config.json");
+		writeFileSync(configPath, JSON.stringify({ searchPaths: [join(root, "docs")], workspacePath: root }));
+		const report = await runSetup({
+			configPath,
+			workspacePath: root,
+			deps: {
+				env: { PATH: "/bin", HOME: root },
+				executable: () => undefined,
+				pathExists: () => true,
+				acquireLock: fakeLock,
+				runtime: {
+					runtimeStatus: async () => ({
+						state: "stopped",
+						backend: "auto",
+						model: "Qwen3-Embedding-0.6B-Q8_0.gguf",
+						health: { ok: false, code: "unavailable", message: "Gateway is stopped.", retryable: true },
+					}),
+					verifyModel: async () => ({
+						profileId: "qwen3-embedding-0.6b",
+						path: "/cache/model.gguf",
+						hash: "sha",
+					}),
+					ensureRuntime: async () => {
+						throw new Error("spawn failed at /Users/alice/secret token=abc");
+					},
+				},
+			},
+		});
+		expect(report.mode).toBe("bm25");
+		expect(report.runtime.reason).toContain("spawn failed");
+		expect(JSON.stringify(report)).not.toContain("/Users/alice");
+	});
+});
+
+describe("discord native store probe", () => {
+	async function probeDiscord(existing: (path: string) => boolean, env: Record<string, string>) {
+		const root = mkdtempSync(join(tmpdir(), "autorag-setup-discrawl-"));
+		roots.push(root);
+		const configPath = join(root, "config.json");
+		writeFileSync(
+			configPath,
+			JSON.stringify({ searchPaths: [join(root, "docs")], workspacePath: root, datasources: { discord: {} } }),
+		);
+		const report = await runSetup({
+			configPath,
+			workspacePath: root,
+			deps: {
+				env: { PATH: "/bin", ...env },
+				executable: (name) => (name === "discrawl" ? "/opt/homebrew/bin/discrawl" : undefined),
+				pathExists: existing,
+				acquireLock: fakeLock,
+				runtime: {
+					runtimeStatus: async () => {
+						throw new Error("offline");
+					},
+					verifyModel: async () => {
+						throw new Error("offline");
+					},
+				},
+			},
+		});
+		return { root, entry: report.datasources.find((d) => d.name === "discord") };
+	}
+
+	it("finds discrawl's own macOS default store instead of requiring an AutoRAG-managed one", async () => {
+		const home = "/home-under-test";
+		const native = join(home, "Library", "Application Support", "discrawl", "discrawl.db");
+		const { entry } = await probeDiscord((path) => path === native, { HOME: home });
+		expect(entry?.reason).not.toBe("native store is not present");
+		expect(entry?.state).toBe("blocked");
+	});
+
+	it("finds discrawl's XDG data store", async () => {
+		const native = join("/xdg-data", "discrawl", "discrawl.db");
+		const { entry } = await probeDiscord((path) => path === native, { HOME: "/h", XDG_DATA_HOME: "/xdg-data" });
+		expect(entry?.reason).not.toBe("native store is not present");
+	});
+
+	it("still skips discord when no discrawl store exists anywhere", async () => {
+		const { entry } = await probeDiscord(() => false, { HOME: "/nowhere" });
+		expect(entry).toMatchObject({ state: "skipped", reason: "native store is not present" });
+	});
+
+	it("honours an explicit connector store path only", async () => {
+		const root = mkdtempSync(join(tmpdir(), "autorag-setup-discrawl-explicit-"));
+		roots.push(root);
+		const configPath = join(root, "config.json");
+		const explicit = join(root, "custom", "discrawl.db");
+		writeFileSync(
+			configPath,
+			JSON.stringify({ workspacePath: root, datasources: { discord: { connector: { databasePath: explicit } } } }),
+		);
+		const seen: string[] = [];
+		await runSetup({
+			configPath,
+			workspacePath: root,
+			deps: {
+				env: { PATH: "/bin", HOME: "/h" },
+				executable: (name) => (name === "discrawl" ? "/bin/discrawl" : undefined),
+				pathExists: (path) => {
+					seen.push(path);
+					return false;
+				},
+				acquireLock: fakeLock,
+				runtime: {
+					runtimeStatus: async () => {
+						throw new Error("offline");
+					},
+					verifyModel: async () => {
+						throw new Error("offline");
+					},
+				},
+			},
+		});
+		expect(seen.filter((path) => path.includes("discrawl"))).toEqual([explicit]);
+	});
+
+	async function discordCandidates(env: Record<string, string>): Promise<string[]> {
+		const root = mkdtempSync(join(tmpdir(), "autorag-setup-discrawl-home-"));
+		roots.push(root);
+		const configPath = join(root, "config.json");
+		writeFileSync(configPath, JSON.stringify({ workspacePath: root, datasources: { discord: {} } }));
+		const seen: string[] = [];
+		await runSetup({
+			configPath,
+			workspacePath: root,
+			deps: {
+				env: { PATH: "/bin", ...env },
+				executable: (name) => (name === "discrawl" ? "/bin/discrawl" : undefined),
+				pathExists: (path) => {
+					seen.push(path);
+					return false;
+				},
+				acquireLock: fakeLock,
+				runtime: {
+					runtimeStatus: async () => {
+						throw new Error("offline");
+					},
+					verifyModel: async () => {
+						throw new Error("offline");
+					},
+				},
+			},
+		});
+		return seen.filter((path) => path.includes("discrawl"));
+	}
+
+	it("resolves an empty or relative HOME to an absolute OS home", async () => {
+		for (const home of ["", "relative-home"]) {
+			const candidates = await discordCandidates({ HOME: home });
+			expect(candidates.length).toBeGreaterThan(0);
+			expect(candidates.every((path) => isAbsolute(path))).toBe(true);
+		}
+	});
+
+	it("falls back to USERPROFILE when HOME is unset", async () => {
+		const candidates = await discordCandidates({ USERPROFILE: "/win-home" });
+		expect(candidates).toContain(join("/win-home", "Library", "Application Support", "discrawl", "discrawl.db"));
+		expect(candidates).toContain(join("/win-home", ".discrawl", "discrawl.db"));
+	});
+
+	it("ignores a relative XDG_DATA_HOME", async () => {
+		const candidates = await discordCandidates({ HOME: "/h", XDG_DATA_HOME: "relative-xdg" });
+		expect(candidates).not.toContain(join("relative-xdg", "discrawl", "discrawl.db"));
+	});
+});

@@ -1,0 +1,187 @@
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+	assertAbsoluteReadableSource,
+	assertLiteRetrieveHealthy,
+	assertLiteRetrieveReportsSkippedSurface,
+	assertServiceReady,
+	buildLiveStackOptions,
+	cleanupCloneState,
+	isFingerprintCurrent,
+	tryAcquireWorkflowLock,
+} from "../../scripts/live-e2e/workflow.mjs";
+
+const roots: string[] = [];
+
+afterEach(() => {
+	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+function tempRoot(): string {
+	const root = mkdtempSync(join(tmpdir(), "autorag-live-workflow-test-"));
+	roots.push(root);
+	return root;
+}
+
+describe("live-e2e core workflow invariants", () => {
+	it("refuses stale fingerprints rather than treating warm state as reusable", () => {
+		expect(
+			isFingerprintCurrent(
+				{ corpusDigest: "old", embeddingModel: "Qwen3-Embedding-0.6B-Q8_0.gguf" },
+				{ corpusDigest: "new", embeddingModel: "Qwen3-Embedding-0.6B-Q8_0.gguf" },
+			),
+		).toBe(false);
+	});
+
+	it("refuses an unavailable embedding service with a stable diagnostic", () => {
+		expect(() => assertServiceReady({ verdict: "refused", code: "live-e2e-embedding-unavailable" })).toThrow(
+			"live-e2e-embedding-unavailable",
+		);
+	});
+
+	it("requires a healthy lite retrieve run to state that nothing was skipped", () => {
+		const envelope = { ok: true, results: [{ source: "/corpus/sample.txt" }], unsearched: [] };
+		expect(assertLiteRetrieveHealthy(envelope, "/corpus/sample.txt")).toBe(true);
+		// A pre-#1636 envelope has no `unsearched` field at all; that must fail loudly.
+		const legacy = { ok: true, results: envelope.results } as unknown as typeof envelope;
+		expect(() => assertLiteRetrieveHealthy(legacy, "/corpus/sample.txt")).toThrow("lite-retrieve-unsearched-missing");
+		expect(() =>
+			assertLiteRetrieveHealthy(
+				{ ...envelope, unsearched: [{ surface: "minsync", methods: ["minsync"], reason: "down" }] },
+				"/corpus/sample.txt",
+			),
+		).toThrow("lite-retrieve-unexpected-unsearched");
+	});
+
+	it("requires a skipped surface to carry the real error, not a placeholder", () => {
+		const degraded = {
+			ok: true,
+			results: [],
+			unsearched: [
+				{
+					surface: "minsync",
+					methods: ["hybrid", "minsync"],
+					reason: "MinSyncQueryError: connect ECONNREFUSED 127.0.0.1:9",
+				},
+			],
+		};
+		expect(assertLiteRetrieveReportsSkippedSurface(degraded, "minsync").reason).toContain("ECONNREFUSED");
+		expect(() => assertLiteRetrieveReportsSkippedSurface(degraded, "discord")).toThrow(
+			"lite-retrieve-surface-not-reported:discord",
+		);
+		const suppressed = {
+			...degraded,
+			unsearched: [{ ...degraded.unsearched[0], reason: "path details suppressed" }],
+		};
+		expect(() => assertLiteRetrieveReportsSkippedSurface(suppressed, "minsync")).toThrow(
+			"lite-retrieve-reason-suppressed",
+		);
+		const empty = { ...degraded, unsearched: [{ ...degraded.unsearched[0], reason: "  " }] };
+		expect(() => assertLiteRetrieveReportsSkippedSurface(empty, "minsync")).toThrow("lite-retrieve-reason-missing");
+	});
+
+	it("reports lock contention without allowing a second workflow", () => {
+		const root = tempRoot();
+		const first = tryAcquireWorkflowLock(root);
+		expect(first.ok).toBe(true);
+		const second = tryAcquireWorkflowLock(root);
+		expect(second).toMatchObject({ ok: false, code: "live-e2e-lock-held" });
+		first.release?.();
+	});
+
+	it("cleanup removes clone state but preserves the shared corpus", () => {
+		const root = tempRoot();
+		const shared = join(root, "corpus");
+		const clone = join(root, ".autorag-e2e");
+		mkdirSync(shared, { recursive: true });
+		mkdirSync(clone, { recursive: true });
+		writeFileSync(join(shared, "fixture.txt"), "fixture");
+		writeFileSync(join(clone, "state"), "state");
+		cleanupCloneState(clone, shared);
+		expect(readFileSync(join(shared, "fixture.txt"), "utf8")).toBe("fixture");
+		expect(() => readFileSync(join(clone, "state"))).toThrow();
+	});
+
+	it("canonicalizes readable source paths before comparing retrieval sources", () => {
+		const root = tempRoot();
+		const actual = join(root, "actual.txt");
+		const alias = join(root, "alias.txt");
+		writeFileSync(actual, "readable");
+		symlinkSync(actual, alias);
+		expect(assertAbsoluteReadableSource(alias)).toBe(realpathSync(actual));
+	});
+
+	it("builds the agent with clone-local workspace and shared search path", () => {
+		const root = tempRoot();
+		const workspace = join(root, ".autorag-e2e", "workspace");
+		const previous = process.env.AUTORAG_LIVE_E2E_EMBEDDER;
+		try {
+			process.env.AUTORAG_LIVE_E2E_EMBEDDER = "gateway";
+			const options = buildLiveStackOptions(root, workspace);
+			expect(options.workspacePath).toBe(workspace);
+			expect(options.searchPaths).toEqual([join(root, "corpus")]);
+			expect(options.workspacePath).not.toBe(root);
+			// The corpus root is immutable fixture state: jikji must never run
+			// against it, and the gateway embedder points at the pinned loopback TEI.
+			expect(options.jikji).toBe(false);
+			expect(options.minSync).toMatchObject({
+				autoInstall: false,
+				embedder: {
+					id: "tei:Qwen3-Embedding-0.6B-Q8_0.gguf",
+					dimension: 1024,
+				},
+			});
+		} finally {
+			restoreEmbedderEnv(previous);
+		}
+	});
+
+	it("defaults to the native embedder with auto-install inside Docker", () => {
+		const root = tempRoot();
+		const workspace = join(root, ".autorag-e2e", "workspace");
+		const previous = process.env.AUTORAG_LIVE_E2E_EMBEDDER;
+		try {
+			process.env.AUTORAG_LIVE_E2E_EMBEDDER = "native";
+			const options = buildLiveStackOptions(root, workspace);
+			expect(options.jikji).toBe(false);
+			expect(options.minSync).toMatchObject({
+				autoInstall: true,
+				embedder: { id: "native:Qwen/Qwen3-Embedding-0.6B", dimension: 1024 },
+			});
+		} finally {
+			restoreEmbedderEnv(previous);
+		}
+	});
+
+	function restoreEmbedderEnv(previous: string | undefined): void {
+		if (previous === undefined) delete process.env.AUTORAG_LIVE_E2E_EMBEDDER;
+		else process.env.AUTORAG_LIVE_E2E_EMBEDDER = previous;
+	}
+
+	it("keeps mutable parsed state out of the shared corpus root", () => {
+		const root = tempRoot();
+		const workspace = join(root, ".autorag-e2e", "workspace");
+		mkdirSync(join(workspace, ".autorag", "parsed"), { recursive: true });
+		expect(existsSync(join(root, ".autorag"))).toBe(false);
+		expect(existsSync(join(workspace, ".autorag", "parsed"))).toBe(true);
+	});
+
+	it("accepts only absolute existing readable source paths", () => {
+		const root = tempRoot();
+		const source = join(root, "source.txt");
+		writeFileSync(source, "readable");
+		expect(assertAbsoluteReadableSource(source)).toBe(realpathSync(source));
+		expect(() => assertAbsoluteReadableSource("relative.txt")).toThrow("source-not-absolute");
+	});
+});

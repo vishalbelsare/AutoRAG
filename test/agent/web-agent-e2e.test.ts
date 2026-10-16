@@ -1,0 +1,115 @@
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+import {
+	type FauxProviderRegistration,
+	type FauxResponseStep,
+	fauxAssistantMessage,
+	fauxToolCall,
+} from "@earendil-works/pi-ai";
+import { registerFauxProvider } from "@earendil-works/pi-ai/compat";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AutoRAGAgent } from "../../src/agent/agent.ts";
+import { WEB_FETCH_TOOL_NAME } from "../../src/agent/web-fetch-tool.ts";
+import { WEB_SEARCH_TOOL_NAME } from "../../src/agent/web-search-tool.ts";
+import { clearRegisteredSearchProviders, registerSearchProvider } from "../../src/web/search/provider.ts";
+import { SEARCH_PROVIDER_ORDER } from "../../src/web/search/types.ts";
+import { storedEvidence } from "../helpers/stored-evidence.ts";
+
+let root: string;
+let registrations: FauxProviderRegistration[];
+
+beforeEach(() => {
+	root = mkdtempSync(join(tmpdir(), "autorag-web-e2e-"));
+	registrations = [];
+});
+
+afterEach(() => {
+	vi.unstubAllGlobals();
+	for (const reg of registrations) reg.unregister();
+	clearRegisteredSearchProviders();
+	rmSync(root, { recursive: true, force: true });
+});
+
+function fauxModel(...responses: FauxResponseStep[]) {
+	const reg = registerFauxProvider({ api: `faux-${randomUUID()}`, models: [{ id: "faux-model" }] });
+	reg.setResponses(responses);
+	registrations.push(reg);
+	return reg.getModel();
+}
+
+const POLICY_HTML = `<!doctype html><html><head><title>Refund Policy 2026</title></head><body><main>
+<h1>Refund Policy</h1>
+<p>Refund exceptions require director approval before payout. Finance acknowledged the policy in the July review.</p>
+</main></body></html>`;
+
+describe("AutoRAGAgent actively uses the web tools", () => {
+	it("calls web_search and web_fetch during searchDocuments and curates from them", async () => {
+		// The provider chain is stubbed through the registry seam; the web_fetch
+		// transport is stubbed at global fetch. No network is touched.
+		registerSearchProvider({
+			id: "duckduckgo",
+			label: "Fake DuckDuckGo",
+			isAvailable: () => true,
+			search: async () => ({
+				provider: "duckduckgo",
+				sources: [
+					{
+						title: "Refund Policy 2026",
+						url: "https://policy.example.com/refunds",
+						snippet: "Refund exceptions require director approval before payout.",
+					},
+				],
+			}),
+		});
+		vi.stubGlobal("fetch", async (input: unknown) => {
+			const url = String(input);
+			if (url.startsWith("https://policy.example.com/")) {
+				return new Response(POLICY_HTML, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+			}
+			return new Response("not found", { status: 404 });
+		});
+
+		const model = fauxModel(
+			fauxAssistantMessage("Initial pass.", { stopReason: "stop" }),
+			fauxAssistantMessage([fauxToolCall(WEB_SEARCH_TOOL_NAME, { query: "refund director approval policy 2026" })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage([fauxToolCall(WEB_FETCH_TOOL_NAME, { url: "https://policy.example.com/refunds" })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("Refund exceptions require director approval before payout. [e1]", {
+				stopReason: "stop",
+			}),
+		);
+
+		const agent = new AutoRAGAgent({
+			model,
+			searchPaths: [root],
+			memoryPath: join(root, "memory.json"),
+			workspacePath: root,
+			minSync: { autoInstall: false },
+			jikji: false,
+			// Routing belongs to this agent instance: only the stubbed engine runs.
+			webSearch: {
+				order: ["duckduckgo"],
+				exclude: SEARCH_PROVIDER_ORDER.filter((id) => id !== "duckduckgo"),
+			},
+		});
+
+		const names = (
+			(agent as unknown as { innerAgent: { state: { tools: AgentTool[] } } }).innerAgent.state.tools ?? []
+		).map((tool) => tool.name);
+		expect(names).toContain(WEB_SEARCH_TOOL_NAME);
+		expect(names).toContain(WEB_FETCH_TOOL_NAME);
+
+		const response = await agent.searchDocuments("What is the current refund approval policy?", { topK: 2 });
+		expect(response.results).toHaveLength(1);
+		expect(response.answer).toContain("[1]");
+		expect(storedEvidence(join(root, "memory.json"), response.sessionId, 1)[0]?.source).toBe(
+			"https://policy.example.com/refunds",
+		);
+	});
+});
